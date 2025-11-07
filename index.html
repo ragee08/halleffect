@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Hall Effect Voltage Monitor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, Arial; margin: 20px; color:#111 }
+    .card { border-radius:12px; padding:16px; box-shadow:0 6px 18px rgba(0,0,0,0.08); background:#fff; max-width:900px }
+    h1 { margin:0 0 12px 0; font-size:20px }
+    #status { font-weight:600; margin-bottom:10px }
+    #value { font-size:28px; font-weight:700; margin:12px 0 }
+    #controls { margin-bottom:12px }
+    button { padding:8px 12px; border-radius:8px; border: none; cursor:pointer }
+    #connectBtn { background:#0b6; color:#012; }
+    #disconnectBtn { background:#f55; color:#fff; margin-left:8px }
+    #exportBtn { margin-left:8px }
+    canvas { width:100%; height:260px; border-radius:8px; background:linear-gradient(180deg,#fafafa,#fff) }
+    small { color:#666 }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Hall Effect Voltage Monitor</h1>
+    <div id="status">Status: <span id="statustxt">Not connected</span></div>
+
+    <div id="controls">
+      <label for="baud">Baud:</label>
+      <select id="baud"><option>9600</option><option>115200</option></select>
+      <button id="connectBtn">Connect</button>
+      <button id="disconnectBtn" disabled>Disconnect</button>
+      <button id="exportBtn" disabled>Export CSV</button>
+    </div>
+
+    <div>
+      <div>Latest Hall Voltage</div>
+      <div id="value">— V</div>
+      <small>Expected serial line format from Arduino: <code>Hall Voltage: 2.50 V</code></small>
+    </div>
+
+    <hr />
+
+    <canvas id="chart"></canvas>
+    <div style="margin-top:8px"><small>Live plot (last 100 samples)</small></div>
+  </div>
+
+<script>
+(async () => {
+  // UI elements
+  const connectBtn = document.getElementById('connectBtn');
+  const disconnectBtn = document.getElementById('disconnectBtn');
+  const exportBtn = document.getElementById('exportBtn');
+  const statusTxt = document.getElementById('statustxt');
+  const valueEl = document.getElementById('value');
+  const baudSelect = document.getElementById('baud');
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+
+  // Data buffer for plotting
+  const maxPoints = 100;
+  let data = [];
+  let timestamps = [];
+
+  // Serial port variables
+  let port = null;
+  let reader = null;
+  let reading = false;
+
+  // Canvas resizing
+  function resizeCanvas(){
+    canvas.width = canvas.clientWidth * devicePixelRatio;
+    canvas.height = 260 * devicePixelRatio;
+  }
+  window.addEventListener('resize', () => { resizeCanvas(); draw(); });
+  resizeCanvas();
+
+  // Draw chart (simple)
+  function draw(){
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+    ctx.save();
+    ctx.scale(devicePixelRatio, devicePixelRatio);
+
+    // background
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0,0,w/devicePixelRatio,h/devicePixelRatio);
+
+    // Draw axes
+    const pw = canvas.clientWidth;
+    const ph = 260;
+    ctx.strokeStyle = '#ddd';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(40,10);
+    ctx.lineTo(40,ph-30);
+    ctx.lineTo(pw-10,ph-30);
+    ctx.stroke();
+
+    // If no data
+    if(data.length === 0){
+      ctx.fillStyle = '#777';
+      ctx.font = '14px system-ui';
+      ctx.fillText('No samples yet — connect and run the Arduino sketch', 50, 120);
+      ctx.restore();
+      return;
+    }
+
+    // compute min/max with small padding
+    let min = Math.min(...data);
+    let max = Math.max(...data);
+    if(min === max){ min -= 0.5; max += 0.5; }
+    const pad = (max - min) * 0.1;
+    min -= pad; max += pad;
+
+    // draw grid horizontal lines and labels
+    ctx.fillStyle = '#444';
+    ctx.font = '12px system-ui';
+    const gridLines = 4;
+    for(let i=0;i<=gridLines;i++){
+      const y = 10 + ((ph-40) * (i / gridLines));
+      ctx.strokeStyle = '#f0f0f0';
+      ctx.beginPath();
+      ctx.moveTo(45, y);
+      ctx.lineTo(pw-10, y);
+      ctx.stroke();
+
+      // label
+      const v = (max - (i / gridLines) * (max - min));
+      ctx.fillStyle = '#555';
+      ctx.fillText(v.toFixed(2) + ' V', 5, y+4);
+    }
+
+    // plot line
+    ctx.beginPath();
+    for(let i=0;i<data.length;i++){
+      const x = 45 + ( (pw-55) * (i/(maxPoints-1 || 1)) );
+      const y = 10 + ( (ph-40) * (1 - (data[i]-min)/(max-min)) );
+      if(i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#0b6';
+    ctx.stroke();
+
+    // last point marker
+    const lastX = 45 + ( (pw-55) * ((data.length-1)/(maxPoints-1 || 1)) );
+    const lastY = 10 + ( (ph-40) * (1 - (data[data.length-1]-min)/(max-min)) );
+    ctx.beginPath();
+    ctx.fillStyle = '#085';
+    ctx.arc(lastX, lastY, 3, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // Append new sample
+  function pushSample(v){
+    const now = new Date();
+    data.push(v);
+    timestamps.push(now);
+    if(data.length > maxPoints) { data.shift(); timestamps.shift(); }
+    valueEl.textContent = v.toFixed(3) + ' V';
+    draw();
+  }
+
+  // Export CSV
+  exportBtn.addEventListener('click', () => {
+    if(data.length === 0) return;
+    let csv = 'timestamp,voltage_v\n';
+    for(let i=0;i<data.length;i++){
+      csv += `${timestamps[i].toISOString()},${data[i].toFixed(6)}\n`;
+    }
+    const blob = new Blob([csv], {type:'text/csv'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'hall_voltage.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  // Connect flow
+  connectBtn.addEventListener('click', async () => {
+    try {
+      if(!('serial' in navigator)){
+        alert('Web Serial API not supported in this browser. Use Chrome/Edge.');
+        return;
+      }
+      // Request port from user
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: parseInt(baudSelect.value || '9600', 10) });
+
+      statusTxt.textContent = 'Connected';
+      connectBtn.disabled = true;
+      disconnectBtn.disabled = false;
+      exportBtn.disabled = false;
+
+      // Setup reader using TextDecoderStream for convenient line parsing
+      const textDecoder = new TextDecoderStream();
+      const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+      reader = textDecoder.readable.getReader();
+
+      reading = true;
+      let buffer = '';
+
+      while(reading){
+        const { value, done } = await reader.read();
+        if(done) break;
+        if(value){
+          // accumulate and split lines
+          buffer += value;
+          let lines = buffer.split(/\r?\n/);
+          buffer = lines.pop(); // last partial line stays in buffer
+          for(const line of lines){
+            handleLine(line.trim());
+          }
+        }
+      }
+
+    } catch (err) {
+      console.error(err);
+      statusTxt.textContent = 'Error: ' + (err.message || err);
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+    }
+  });
+
+  // Disconnect flow
+  disconnectBtn.addEventListener('click', async () => {
+    reading = false;
+    try {
+      if(reader) { await reader.cancel().catch(()=>{}); reader = null; }
+      if(port && port.readable) {
+        try { await port.readable.cancel(); } catch(e){}
+      }
+      if(port) { await port.close().catch(()=>{}); port = null; }
+    } catch (e) {
+      console.warn('Error closing port', e);
+    }
+    statusTxt.textContent = 'Disconnected';
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+  });
+
+  // Try to parse the Arduino line like: "Hall Voltage: 2.51 V"
+  function handleLine(line){
+    if(!line) return;
+    // optionally show debug in console:
+    // console.log('LINE:', line);
+
+    // Look for a number in the line:
+    // common formats: "Hall Voltage: 2.51 V" or "Hall Voltage:2.51 V"
+    const match = line.match(/([-+]?\d*\.?\d+)\s*V/i);
+    if(match){
+      const v = parseFloat(match[1]);
+      if(!isNaN(v)) pushSample(v);
+      return;
+    }
+
+    // fallback: find any float and use it
+    const match2 = line.match(/([-+]?\d*\.?\d+)/);
+    if(match2){
+      const v = parseFloat(match2[1]);
+      if(!isNaN(v)) pushSample(v);
+    }
+  }
+
+  // initial draw
+  draw();
+
+})();
+</script>
+</body>
+</html>
